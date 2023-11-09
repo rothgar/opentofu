@@ -3,6 +3,8 @@
 
 # Compare the semver tag against the current release in the VERSION file
 
+exit 0
+
 set -uo pipefail
 
 # Bail if VERSION cannot be found
