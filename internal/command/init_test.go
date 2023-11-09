@@ -6,14 +6,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/google/go-cmp/cmp"
+	"github.com/hashicorp/terraform-svchost/disco"
 	"github.com/mitchellh/cli"
+	cmdInit "github.com/opentofu/opentofu/internal/backend/init"
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/go-version"
@@ -2277,7 +2282,7 @@ provider "registry.opentofu.org/hashicorp/test" {
 				Meta: m,
 			}
 
-			//write input lockfile
+			// write input lockfile
 			lockFile := ".terraform.lock.hcl"
 			if err := os.WriteFile(lockFile, []byte(tc.input), 0644); err != nil {
 				t.Fatalf("failed to write input lockfile: %s", err)
@@ -2989,4 +2994,110 @@ func expectedPackageInstallPath(name, version string, exe bool) string {
 	return filepath.ToSlash(filepath.Join(
 		baseDir, fmt.Sprintf("registry.opentofu.org/hashicorp/%s/%s/%s", name, version, platform),
 	))
+}
+
+type mockRoundTripper struct {
+	req *http.Request
+	mu  *sync.Mutex
+	err error
+}
+
+func (m *mockRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
+	m.mu.Lock()
+	m.req = request
+	m.mu.Unlock()
+
+	if m.err != nil {
+		return &http.Response{StatusCode: http.StatusInternalServerError}, m.err
+	}
+
+	return &http.Response{StatusCode: http.StatusOK}, nil
+}
+
+func defineTempMainTfFile(t *testing.T, content string) string {
+	const fName = "main.tf"
+
+	td := t.TempDir()
+	if err := os.WriteFile(path.Join(td, fName), []byte(content), 0644); err != nil {
+		t.Fatalf("cannot write to main.tf, err: %v", err)
+	}
+
+	return td
+}
+
+// TestInit_backendRemoteHappyPath tests the "init" command execution assuming the "remote" backend.
+// It is introduced as a "guard rail" to prevent regressions.
+// See https://github.com/opentofu/opentofu/pull/835 for details.
+func TestInit_backendRemoteHappyPath(t *testing.T) {
+	// GIVEN
+
+	// The main.tf definition
+
+	const host = "foo.bar.dev"
+
+	content := fmt.Sprintf(`terraform {
+  backend "remote" {
+    hostname     = "%s"
+    organization = "bar"
+	token        = "XXX"
+    workspaces {
+      name = "baz"
+    }
+  }
+}
+`, host)
+
+	// stored to
+	td := defineTempMainTfFile(t, content)
+	defer testChdir(t, td)()
+
+	// AND a CLI mock
+	ui := new(cli.MockUi)
+	view, _ := testView(t)
+
+	// AND a backend mock
+	// The transport layer to mock the backend
+	transport := &mockRoundTripper{mu: &sync.Mutex{}}
+	discovery := disco.New()
+
+	discovery.Transport = transport
+	discovery.ForceHostServices(host, map[string]interface{}{
+		"tfe.v2.1": "terraform.json",
+		// "versions.v1": "qux",
+	})
+
+	// TODO: overwrite HTTPClient in tfe.go:316,336 ?
+	// It appears the it cannot be done without modification of Remote object in internal/remote/backend.go
+	// In particular, modification would have to be made for the Configure method to set custom HTTPClient in internal/remote/backend.go:327-333
+
+	// init the backend mock
+	cmdInit.Init(discovery)
+
+	// AND a mimic the init command initialised upon execution of `tofu init`
+	c := &InitCommand{
+		Meta: Meta{
+			testingOverrides: metaOverridesForProvider(testProvider()),
+			Ui:               ui,
+			View:             view,
+			Services:         discovery,
+		},
+	}
+
+	// AND the command line options
+	args := []string{}
+
+	// WHEN
+	// `tofu init` is called
+	code := c.Run(args)
+
+	// THEN
+	// A successful execution is expected
+	if code != 0 {
+		t.Fatalf("successful execution is expected: \n%s", ui.ErrorWriter.String())
+	}
+
+	// AND the state file shall be created
+	if _, err := os.Stat(filepath.Join(DefaultDataDir, DefaultStateFilename)); err != nil {
+		t.Fatalf("state file shall be created, err: %v\n", err)
+	}
 }
