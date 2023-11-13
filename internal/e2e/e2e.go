@@ -243,11 +243,15 @@ func GoBuild(pkgPath, tmpPrefix string) string {
 		panic(err)
 	}
 
-	cmd := exec.Command(
-		"go", "build",
-		"-o", tmpFilename,
-		pkgPath,
-	)
+	args := []string{"build"}
+	// To track test coverage
+	// See: https://go.dev/testing/coverage/
+	if os.Getenv("GOCOVERDIR") != "" {
+		args = append(args, "-cover")
+	}
+	args = append(args, []string{"-o", tmpFilename, pkgPath}...)
+
+	cmd := exec.Command("go", args...)
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 
